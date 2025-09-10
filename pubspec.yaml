@@ -1,0 +1,18 @@
+name: seeder
+description: A Dart script for seeding the database.
+version: 1.0.0
+
+environment:
+  sdk: '^3.7.0'
+
+dependencies:
+  postgres: ^2.6.4
+  faker: ^2.2.0
+  shelf: ^1.4.2
+  shelf_router: ^1.1.4
+  prometheus_client: ^1.0.0+1
+  prometheus_client_shelf: ^1.0.0+1
+  dotenv: ^4.2.0
+
+dev_dependencies:
+  lints: ^3.0.0

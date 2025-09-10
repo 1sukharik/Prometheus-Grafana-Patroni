@@ -1,0 +1,29 @@
+FROM ubuntu:latest
+
+RUN apt-get update && \
+    apt-get install -y postgresql-client cron && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY backup.sh /backup.sh
+RUN chmod +x /backup.sh
+
+ENTRYPOINT ["/bin/bash", "-c", "\
+  : \"${DB_HOST:?DB_HOST не задано}\"; \
+  : \"${DB_PORT:?DB_PORT не задано}\"; \
+  : \"${DB_USER:?DB_USER не задано}\"; \
+  : \"${DB_PASSWORD:?DB_PASSWORD не задано}\"; \
+  : \"${DB_NAME:?DB_NAME не задано}\"; \
+  : \"${BACKUP_RETENTION_COUNT:?BACKUP_RETENTION_COUNT не задано}\"; \
+  echo \"DB_HOST=$DB_HOST\" > /etc/cron.d/db-backup; \
+  echo \"DB_PORT=$DB_PORT\" >> /etc/cron.d/db-backup; \
+  echo \"DB_USER=$DB_USER\" >> /etc/cron.d/db-backup; \
+  echo \"DB_PASSWORD=$DB_PASSWORD\" >> /etc/cron.d/db-backup; \
+  echo \"DB_NAME=$DB_NAME\" >> /etc/cron.d/db-backup; \
+  echo \"BACKUP_RETENTION_COUNT=$BACKUP_RETENTION_COUNT\" >> /etc/cron.d/db-backup; \
+  echo \"\" >> /etc/cron.d/db-backup; \
+  echo \"$BACKUP_INTERVAL_CRON root /backup.sh\" >> /etc/cron.d/db-backup; \
+  chmod 0644 /etc/cron.d/db-backup; \
+  crontab /etc/cron.d/db-backup; \
+  mkdir -p /backups; \
+  cron -f \
+"]

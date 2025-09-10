@@ -1,0 +1,55 @@
+scope: delivery
+namespace: /service/
+name: global
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: delivery:8008
+
+etcd:
+  hosts:
+    - etcd:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level:
+          wal_level: replica
+          hot_standby: "on"
+          max_wal_senders: 5
+          wal_keep_segments: 8
+          archive_mode: "off"
+          max_replication_slots: 5
+          wal_log_hints: "on"
+
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - locale: en_US.UTF-8
+
+  pg_hba:
+    - host all all 0.0.0.0/0 md5
+    - host replication replicator 0.0.0.0/0 md5
+  post_bootstrap: /usr/local/bin/init.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: postgres:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/lib/postgresql/15/bin
+  authentication:
+    replication:
+      username: replicator
+      password: replicator
+    superuser:
+      username: postgres
+      password: postgres
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'

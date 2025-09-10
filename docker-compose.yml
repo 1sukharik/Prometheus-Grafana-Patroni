@@ -1,0 +1,299 @@
+version: '3.8'
+
+services:
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.8
+    container_name: etcd
+    command: >
+      /usr/local/bin/etcd
+      --name=etcd0
+      --listen-client-urls=http://0.0.0.0:2379
+      --advertise-client-urls=http://etcd:2379
+      --listen-peer-urls=http://0.0.0.0:2380
+      --initial-advertise-peer-urls=http://etcd:2380
+      --initial-cluster=etcd0=http://etcd:2380
+      --initial-cluster-state=new
+      --enable-v2=true
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    volumes:
+      - etcd_data:/etcd-data
+    healthcheck:
+      test: [ "CMD", "etcdctl", "endpoint", "health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - postgres-network
+
+  delivery:
+    image: my-patroni-postgres:15
+    build:
+      context: ./patroni
+      dockerfile: Dockerfile.patroni
+    container_name: delivery
+    restart: unless-stopped
+    env_file: ./.env
+    environment:
+      - PATRONI_POSTGRESQL_LISTEN=0.0.0.0:5432
+      - PATRONI_POSTGRESQL_CONNECT_ADDRESS=haproxy:5432
+      - PATRONI_POSTGRESQL_DATA_DIR=/var/lib/postgresql/data
+      - PATRONI_POSTGRESQL_BIN_DIR=/usr/lib/postgresql/15/bin
+      - PATRONI_REPLICATION_USERNAME=replicator
+      - PATRONI_REPLICATION_PASSWORD=replicator
+      - PATRONI_SUPERUSER_USERNAME=postgres
+      - PATRONI_SUPERUSER_PASSWORD=${POSTGRES_PASSWORD}
+      - PATRONI_NAME=delivery
+      - PATRONI_SCOPE=delivery
+      - PATRONI_ETCD_HOSTS=etcd:2379
+      - PATRONI_ETCD_PROTOCOL=http
+    ports:
+      - "1234:5432"
+      - "8008:8008"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./patroni/global.yml:/etc/patroni/config.yml:ro
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_USER}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      etcd:
+        condition: service_healthy
+    networks:
+      - postgres-network
+
+  flyway:
+    image: flyway/flyway:latest
+    container_name: flyway
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/flyway/sql
+    env_file:
+      - .env
+    environment:
+      - FLYWAY_URL=jdbc:postgresql://haproxy:5432/${POSTGRES_DB}
+      - FLYWAY_USER=${POSTGRES_USER}
+      - FLYWAY_PASSWORD=${POSTGRES_PASSWORD}
+      - FLYWAY_BASELINE_ON_MIGRATE=false
+      - MIGRATION_VERSION=${MIGRATION_VERSION:-}
+    entrypoint: /bin/sh
+    command: -c "
+      if [ -z \"$MIGRATION_VERSION\" ]; then
+      flyway migrate;
+      else
+      flyway migrate -target=$MIGRATION_VERSION;
+      fi "
+    networks:
+      - postgres-network
+
+  create-roles:
+    image: postgres:latest
+    environment:
+      PGHOST: haproxy
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      ANALYST_NAMES: ${ANALYST_NAMES}
+    volumes:
+      - ./scripts:/scripts
+    command: bash -c "chmod +x /scripts/create_analytic_role.sh && /scripts/create_analytic_role.sh"
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    networks:
+      - postgres-network
+
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    command: [ "dart", "run", "seed/seed.dart" ]
+    environment:
+      - DB_HOST=haproxy
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - APP_ENV=${APP_ENV}
+      - SEED_COUNT=${SEED_COUNT}
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    networks:
+      - postgres-network
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /app
+    ports:
+      - "8080:8080"
+    command: [ "dart", "run", "bin/server.dart" ]
+    environment:
+      POSTGRES_HOST: haproxy
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      APP_ENV: dev
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    env_file:
+      - .env
+    networks:
+      - postgres-network
+
+
+  postgres-exporter:
+      image: prometheuscommunity/postgres-exporter
+      restart: unless-stopped
+      environment:
+        - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@haproxy:5432/${POSTGRES_DB}?sslmode=disable
+        - DATA_SOURCE_USER=${POSTGRES_USER}
+        - DATA_SOURCE_PASS=${POSTGRES_PASSWORD}
+      ports:
+        - "9187:9187"
+      depends_on:
+        haproxy:
+          condition: service_healthy
+      networks:
+        - postgres-network
+
+  prometheus:
+      image: prom/prometheus
+      restart: unless-stopped
+      volumes:
+        - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+        - prometheus_data:/prometheus
+      ports:
+        - "9090:9090"
+      networks:
+        - postgres-network
+
+  grafana:
+      image: grafana/grafana
+      restart: unless-stopped
+      depends_on:
+        - prometheus
+      environment:
+        - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
+        - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      volumes:
+        - grafana_data:/var/lib/grafana
+        - ./monitoring/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+        - ./monitoring/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      ports:
+        - "3100:3000"
+      networks:
+        - postgres-network
+
+  backup:
+    build:
+      context: ./backup
+      dockerfile: Dockerfile.backup
+    container_name: pg_backup
+    environment:
+      - DB_HOST=haproxy
+      - DB_PORT=5432
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB}
+      - BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT}
+      - BACKUP_INTERVAL_CRON=${BACKUP_INTERVAL_CRON}
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    networks:
+        - postgres-network
+    volumes:
+      - ./backups:/backups
+
+  haproxy:
+    image: haproxy:2.8
+    build:
+      context: ./haproxy
+      dockerfile: Dockerfile.haproxy
+    container_name: haproxy
+    depends_on:
+      delivery:
+        condition: service_healthy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "5432:5432"
+      - "8404:8404"
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -fs http://localhost:8404/stats || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - postgres-network
+
+  patroni1:
+    build:
+      context: ./patroni
+      dockerfile: Dockerfile.patroni
+    container_name: patroni1
+    volumes:
+      - patroni1_data:/var/lib/postgresql/data
+      - ./patroni/patroni1.yml:/etc/patroni/config.yml:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      delivery:
+        condition: service_healthy
+    networks:
+      - postgres-network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  patroni2:
+    build:
+      context: ./patroni
+      dockerfile: Dockerfile.patroni
+    container_name: patroni2
+    volumes:
+      - patroni2_data:/var/lib/postgresql/data
+      - ./patroni/patroni2.yml:/etc/patroni/config.yml:ro
+    depends_on:
+      etcd:
+        condition: service_healthy
+      delivery:
+        condition: service_healthy
+    networks:
+      - postgres-network
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  postgres-network:
+    driver: bridge
+volumes:
+  pg_data:
+  prometheus_data:
+  grafana_data:
+  patroni1_data:
+  patroni2_data:
+  etcd_data:
